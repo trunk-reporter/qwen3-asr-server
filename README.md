@@ -7,7 +7,7 @@ Drop-in replacement for whisper-server — any client that talks to the OpenAI `
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU with CUDA support (~4GB VRAM for both models at bfloat16)
+- GPU: NVIDIA CUDA or Apple Silicon MPS (~4GB VRAM for both models at bfloat16). Falls back to CPU if neither is available.
 - `ffmpeg` (required by librosa for non-wav audio formats)
 
 ## Quick Start
@@ -82,7 +82,7 @@ cp .env.example .env
 |---|---|---|
 | `MODEL_PATH` | `qwen3-asr-p25-0.6B` | Path to ASR model directory |
 | `ALIGNER_PATH` | `Qwen3-ForcedAligner-0.6B` | Path to forced aligner directory |
-| `DEVICE` | `cuda:0` | Torch device (`cuda:0`, `cuda:1`, `cpu`) |
+| `DEVICE` | `auto` | Torch device — `auto` picks CUDA > MPS > CPU; or pin with `cuda:0`, `mps`, `cpu` |
 | `DTYPE` | `bfloat16` | Model precision (`bfloat16`, `float16`, `float32`) |
 | `MAX_NEW_TOKENS` | `512` | Max generated tokens per transcription |
 | `HOST` | `0.0.0.0` | Server bind address |
@@ -92,6 +92,7 @@ cp .env.example .env
 | `REPETITION_THRESHOLD` | `4` | Reject if any n-gram repeats this many times (decoding loop detection) |
 | `INFERENCE_TIMEOUT` | `30` | Per-request inference timeout in seconds |
 | `GRACEFUL_SHUTDOWN_TIMEOUT` | `15` | Seconds to drain in-flight requests on shutdown |
+| `PYTORCH_MPS_HIGH_WATERMARK_RATIO` | *(unset)* | Cap MPS memory allocations (0.0–1.0). Set to `0.7` on memory-constrained Macs. |
 
 ## API
 
@@ -162,7 +163,19 @@ Lists the loaded model. Compatible with OpenAI model listing.
 
 ### `GET /health`
 
-Returns server status, model info, and current configuration.
+Returns server status, model info, current configuration, and per-worker request counters.
+
+## Device Auto-Detection
+
+The server automatically selects the best available device at startup:
+
+1. **CUDA** (NVIDIA GPU) — preferred on Linux/Windows
+2. **MPS** (Apple Silicon) — preferred on macOS 12.3+
+3. **CPU** — universal fallback
+
+Set `DEVICE=auto` (the default) for automatic selection, or pin a specific device with `DEVICE=cuda:0`, `DEVICE=mps`, or `DEVICE=cpu`. If the requested device isn't available, the server falls back to CPU with a warning.
+
+On Apple Silicon, the server automatically flushes the MPS memory cache after each request to prevent memory accumulation. If you hit memory limits, set `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7` to cap MPS allocations. The server also probes bfloat16 support on MPS at startup and falls back to float16 if needed.
 
 ## Speech Detection
 
