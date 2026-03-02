@@ -18,6 +18,7 @@ Endpoints:
 """
 
 import os
+import re
 import tempfile
 import time
 from typing import Optional
@@ -46,6 +47,39 @@ WORKERS = int(os.environ.get("WORKERS", "1"))
 # RMS energy threshold: audio below this is silence/static/encrypted
 # Empirically: hallucinations <0.003 RMS, real speech >0.03 RMS
 SPEECH_RMS_THRESHOLD = float(os.environ.get("SPEECH_RMS_THRESHOLD", "0.01"))
+
+# Hallucination detection — known phrases that models produce on noise/static
+# that passes the RMS gate but contains no intelligible speech.
+# Normalized to lowercase alphanumeric for fuzzy matching.
+_HALLUCINATION_PHRASES = {
+    "hello how are you doing today the weather is beautiful and the world seems full of possibilities",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subscribe to my channel",
+    "thank you for listening",
+    "thanks for listening",
+    "please like and subscribe",
+    "the end",
+    "you",
+    "bye",
+}
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase, strip punctuation/whitespace for hallucination matching."""
+    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+
+def is_hallucination(text: str) -> bool:
+    """Check if transcription is a known hallucination phrase.
+
+    Uses normalized substring matching — if the entire transcription output
+    matches a known hallucination phrase, it's rejected. Short outputs (<3 words)
+    that aren't plausible dispatch content are also caught.
+    """
+    norm = _normalize_for_match(text)
+    if not norm:
+        return False
+    return norm in _HALLUCINATION_PHRASES
 
 # MPS memory management — cap MPS allocations to this fraction of system RAM.
 # Lowering this causes MPS to raise an error earlier rather than crashing hard.
@@ -172,7 +206,7 @@ print(f"Device: {DEVICE}  |  dtype: {_DTYPE_OBJ}  |  device_map: {_DEVICE_MAP}")
 # ---------------------------------------------------------------------------
 # App + model
 # ---------------------------------------------------------------------------
-app = FastAPI(title="qwen3-asr-p25-server", version="1.2.0")
+app = FastAPI(title="qwen3-asr-p25-server", version="1.3.0")
 model: Optional[Qwen3ASRModel] = None
 
 
@@ -252,15 +286,20 @@ async def transcribe(
             full_text = r.text.strip() if r else ""
             processing_time = round(time.time() - t0, 3)
 
-            # Build word list from timestamps
-            words = []
-            if want_timestamps and r and r.time_stamps:
-                for item in r.time_stamps:
-                    words.append({
-                        "word": item.text,
-                        "start": round(item.start_time, 3),
-                        "end": round(item.end_time, 3),
-                    })
+            # Hallucination filter — reject known bogus phrases
+            if is_hallucination(full_text):
+                full_text = ""
+                words = []
+            else:
+                # Build word list from timestamps
+                words = []
+                if want_timestamps and r and r.time_stamps:
+                    for item in r.time_stamps:
+                        words.append({
+                            "word": item.text,
+                            "start": round(item.start_time, 3),
+                            "end": round(item.end_time, 3),
+                        })
 
     finally:
         os.unlink(tmp_path)
@@ -317,6 +356,7 @@ def health():
         "workers": WORKERS,
         "pid": os.getpid(),
         "speech_rms_threshold": SPEECH_RMS_THRESHOLD,
+        "hallucination_phrases": len(_HALLUCINATION_PHRASES),
     }
 
 
