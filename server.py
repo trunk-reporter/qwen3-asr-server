@@ -17,6 +17,8 @@ Endpoints:
     GET  /health                   — Health check
 """
 
+import asyncio
+import logging
 import os
 import re
 import tempfile
@@ -30,6 +32,15 @@ import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from qwen_asr import Qwen3ASRModel
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s [%(process)d] %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("qwen3-asr")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -47,6 +58,15 @@ WORKERS = int(os.environ.get("WORKERS", "1"))
 # RMS energy threshold: audio below this is silence/static/encrypted
 # Empirically: hallucinations <0.003 RMS, real speech >0.03 RMS
 SPEECH_RMS_THRESHOLD = float(os.environ.get("SPEECH_RMS_THRESHOLD", "0.01"))
+
+# Repetition loop detection — reject decoding loops like "Engine 5 Engine 5 Engine 5 Engine 5"
+REPETITION_THRESHOLD = int(os.environ.get("REPETITION_THRESHOLD", "4"))
+
+# Per-request inference timeout (seconds) — catches pathological decoding
+INFERENCE_TIMEOUT = int(os.environ.get("INFERENCE_TIMEOUT", "30"))
+
+# Graceful shutdown timeout (seconds) — drain in-flight requests before exit
+GRACEFUL_SHUTDOWN_TIMEOUT = int(os.environ.get("GRACEFUL_SHUTDOWN_TIMEOUT", "15"))
 
 # Hallucination detection — known phrases that models produce on noise/static
 # that passes the RMS gate but contains no intelligible speech.
@@ -69,17 +89,46 @@ def _normalize_for_match(text: str) -> str:
     """Lowercase, strip punctuation/whitespace for hallucination matching."""
     return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
 
-def is_hallucination(text: str) -> bool:
+def is_hallucination(text: str) -> tuple[bool, str]:
     """Check if transcription is a known hallucination phrase.
 
     Uses normalized substring matching — if the entire transcription output
     matches a known hallucination phrase, it's rejected. Short outputs (<3 words)
     that aren't plausible dispatch content are also caught.
+
+    Returns (is_hallucination, matched_phrase).
     """
     norm = _normalize_for_match(text)
     if not norm:
-        return False
-    return norm in _HALLUCINATION_PHRASES
+        return False, ""
+    if norm in _HALLUCINATION_PHRASES:
+        return True, norm
+    return False, ""
+
+def has_repetition_loop(text: str) -> tuple[bool, str]:
+    """Detect repetition loops in transcription output.
+
+    Checks n-grams of size 1-4. If any n-gram repeats REPETITION_THRESHOLD
+    or more times, the text is flagged as a decoding loop.
+
+    Only checks texts with 8+ words — short texts can't have 4 meaningful reps.
+
+    Returns (is_loop, repeated_pattern).
+    """
+    words = text.split()
+    if len(words) < 8:
+        return False, ""
+
+    for n in range(1, 5):  # 1-gram through 4-gram
+        if len(words) < n:
+            continue
+        counts: dict[str, int] = {}
+        for i in range(len(words) - n + 1):
+            gram = " ".join(words[i:i + n])
+            counts[gram] = counts.get(gram, 0) + 1
+            if counts[gram] >= REPETITION_THRESHOLD:
+                return True, gram
+    return False, ""
 
 # MPS memory management — cap MPS allocations to this fraction of system RAM.
 # Lowering this causes MPS to raise an error earlier rather than crashing hard.
@@ -113,6 +162,18 @@ LANG_MAP = {
 }
 
 # ---------------------------------------------------------------------------
+# Per-worker counters
+# ---------------------------------------------------------------------------
+_counters = {
+    "ok": 0,
+    "reject_rms_gate": 0,
+    "reject_hallucination": 0,
+    "reject_repetition_loop": 0,
+    "reject_timeout": 0,
+    "total": 0,
+}
+
+# ---------------------------------------------------------------------------
 # Device + dtype resolution
 # ---------------------------------------------------------------------------
 
@@ -138,11 +199,11 @@ def resolve_device(requested: str) -> str:
         return "cpu"
 
     if req.startswith("cuda") and not torch.cuda.is_available():
-        print(f"WARNING: CUDA requested but not available — falling back to CPU")
+        logger.warning("CUDA requested but not available — falling back to CPU")
         return "cpu"
 
     if req == "mps" and not torch.backends.mps.is_available():
-        print(f"WARNING: MPS requested but not available — falling back to CPU")
+        logger.warning("MPS requested but not available — falling back to CPU")
         return "cpu"
 
     return req
@@ -160,9 +221,9 @@ def resolve_dtype(dtype_str: str, device: str) -> torch.dtype:
     if device == "mps" and dt == torch.bfloat16:
         try:
             torch.zeros(1, dtype=torch.bfloat16, device="mps")
-            print("MPS bfloat16 probe: supported v")
+            logger.info("MPS bfloat16 probe: supported")
         except (RuntimeError, TypeError):
-            print("MPS bfloat16 not supported on this system — using float16 instead")
+            logger.info("MPS bfloat16 not supported on this system — using float16 instead")
             dt = torch.float16
 
     return dt
@@ -201,32 +262,44 @@ DEVICE = resolve_device(_DEVICE_RAW)
 _DTYPE_OBJ = resolve_dtype(DTYPE, DEVICE)
 _DEVICE_MAP = device_map_arg(DEVICE)
 
-print(f"Device: {DEVICE}  |  dtype: {_DTYPE_OBJ}  |  device_map: {_DEVICE_MAP}")
+logger.info(f"Device: {DEVICE}  |  dtype: {_DTYPE_OBJ}  |  device_map: {_DEVICE_MAP}")
 
 # ---------------------------------------------------------------------------
 # App + model
 # ---------------------------------------------------------------------------
-app = FastAPI(title="qwen3-asr-p25-server", version="1.3.0")
+app = FastAPI(title="qwen3-asr-p25-server", version="1.4.0")
 model: Optional[Qwen3ASRModel] = None
 
 
-def has_speech(audio_path: str) -> bool:
+def has_speech(audio_path: str) -> tuple[bool, float]:
     """Check if audio contains actual speech via RMS energy.
 
     Rejects blank/encrypted/silent audio that would cause hallucinations.
     Empirically: blank P25 audio <0.003 RMS, real speech >0.03 RMS.
     Uses librosa to support all audio formats (wav, m4a, etc.).
+
+    Returns (has_speech, rms_value).
     """
     audio, _ = librosa.load(audio_path, sr=None, mono=True)
     rms = float(np.sqrt(np.mean(audio ** 2)))
-    return rms >= SPEECH_RMS_THRESHOLD
+    return rms >= SPEECH_RMS_THRESHOLD, rms
+
+
+def _run_inference(audio_path: str, lang: str, want_timestamps: bool):
+    """Synchronous inference helper — runs model.transcribe() in a thread."""
+    results = model.transcribe(
+        audio=audio_path,
+        language=lang,
+        return_time_stamps=want_timestamps,
+    )
+    return results
 
 
 @app.on_event("startup")
 def load_model():
     global model
-    print(f"Loading model: {MODEL_PATH} (device={DEVICE}, dtype={DTYPE})")
-    print(f"Loading aligner: {ALIGNER_PATH}")
+    logger.info(f"Loading model: {MODEL_PATH} (device={DEVICE}, dtype={DTYPE})")
+    logger.info(f"Loading aligner: {ALIGNER_PATH}")
     model = Qwen3ASRModel.from_pretrained(
         MODEL_PATH,
         forced_aligner=ALIGNER_PATH,
@@ -235,8 +308,18 @@ def load_model():
         device_map=_DEVICE_MAP,
         max_new_tokens=MAX_NEW_TOKENS,
     )
-    print("Model + aligner loaded.")
-    print(f"Speech detection: RMS threshold={SPEECH_RMS_THRESHOLD}")
+    logger.info("Model + aligner loaded.")
+    logger.info(f"Speech detection: RMS threshold={SPEECH_RMS_THRESHOLD}")
+    logger.info(f"Repetition detection: threshold={REPETITION_THRESHOLD}")
+    logger.info(f"Inference timeout: {INFERENCE_TIMEOUT}s")
+    logger.info(f"Graceful shutdown timeout: {GRACEFUL_SHUTDOWN_TIMEOUT}s")
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    logger.info(
+        f"Shutting down — counters: {_counters}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +335,8 @@ async def transcribe(
     timestamp_granularities: Optional[list[str]] = Form(None, alias="timestamp_granularities[]"),
 ):
     t0 = time.time()
+    filename = file.filename or "unknown"
+    _counters["total"] += 1
 
     # Determine if timestamps requested
     want_timestamps = word_timestamps or bool(
@@ -264,48 +349,100 @@ async def transcribe(
 
     # Write upload to temp file
     data = await file.read()
-    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    suffix = os.path.splitext(filename)[1] or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
 
     try:
-        # Speech detection gate — skip GPU inference for blank/encrypted audio
-        if not has_speech(tmp_path):
+        # --- RMS gate ---
+        speech_detected, rms_value = has_speech(tmp_path)
+        if not speech_detected:
             processing_time = round(time.time() - t0, 3)
+            _counters["reject_rms_gate"] += 1
+            logger.warning(
+                f"REJECT rms_gate file={filename} rms={rms_value:.4f} "
+                f"threshold={SPEECH_RMS_THRESHOLD} time={processing_time}s"
+            )
             full_text = ""
             words = []
         else:
-            results = model.transcribe(
-                audio=tmp_path,
-                language=lang,
-                return_time_stamps=want_timestamps,
-            )
+            # --- Inference with timeout ---
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(_run_inference, tmp_path, lang, want_timestamps),
+                    timeout=INFERENCE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                processing_time = round(time.time() - t0, 3)
+                _counters["reject_timeout"] += 1
+                logger.warning(
+                    f"REJECT timeout file={filename} limit={INFERENCE_TIMEOUT}s "
+                    f"time={processing_time}s"
+                )
+                full_text = ""
+                words = []
+                # Skip hallucination/repetition checks — go straight to response
+                return _format_response(response_format, full_text, words, lang,
+                                        want_timestamps, round(time.time() - t0, 3))
 
             r = results[0] if results else None
             full_text = r.text.strip() if r else ""
             processing_time = round(time.time() - t0, 3)
 
-            # Hallucination filter — reject known bogus phrases
-            if is_hallucination(full_text):
+            # --- Hallucination filter ---
+            hallucinated, matched_phrase = is_hallucination(full_text)
+            if hallucinated:
+                _counters["reject_hallucination"] += 1
+                logger.warning(
+                    f"REJECT hallucination file={filename} "
+                    f"phrase=\"{matched_phrase}\" time={processing_time}s"
+                )
                 full_text = ""
                 words = []
             else:
-                # Build word list from timestamps
-                words = []
-                if want_timestamps and r and r.time_stamps:
-                    for item in r.time_stamps:
-                        words.append({
-                            "word": item.text,
-                            "start": round(item.start_time, 3),
-                            "end": round(item.end_time, 3),
-                        })
+                # --- Repetition loop filter ---
+                is_loop, loop_pattern = has_repetition_loop(full_text)
+                if is_loop:
+                    _counters["reject_repetition_loop"] += 1
+                    logger.warning(
+                        f"REJECT repetition_loop file={filename} "
+                        f"pattern=\"{loop_pattern}\" words={len(full_text.split())} "
+                        f"time={processing_time}s"
+                    )
+                    full_text = ""
+                    words = []
+                else:
+                    # --- Success ---
+                    _counters["ok"] += 1
+                    word_count = len(full_text.split()) if full_text else 0
+                    logger.info(
+                        f"OK file={filename} words={word_count} "
+                        f"time={processing_time}s"
+                    )
+
+                    # Build word list from timestamps
+                    words = []
+                    if want_timestamps and r and r.time_stamps:
+                        for item in r.time_stamps:
+                            words.append({
+                                "word": item.text,
+                                "start": round(item.start_time, 3),
+                                "end": round(item.end_time, 3),
+                            })
 
     finally:
         os.unlink(tmp_path)
         flush_mps_cache()  # Release MPS memory after every request
 
-    # --- Format response ---
+    processing_time = round(time.time() - t0, 3)
+    return _format_response(response_format, full_text, words, lang,
+                            want_timestamps, processing_time)
+
+
+def _format_response(response_format, full_text, words, lang,
+                     want_timestamps, processing_time):
+    """Build the HTTP response in the requested format."""
     if response_format == "text":
         return PlainTextResponse(full_text)
 
@@ -349,14 +486,21 @@ def list_models():
 def health():
     return {
         "status": "ok",
+        "version": "1.4.0",
         "model": MODEL_PATH,
         "aligner": ALIGNER_PATH,
         "device": DEVICE,
         "dtype": DTYPE,
         "workers": WORKERS,
         "pid": os.getpid(),
-        "speech_rms_threshold": SPEECH_RMS_THRESHOLD,
-        "hallucination_phrases": len(_HALLUCINATION_PHRASES),
+        "config": {
+            "speech_rms_threshold": SPEECH_RMS_THRESHOLD,
+            "hallucination_phrases": len(_HALLUCINATION_PHRASES),
+            "repetition_threshold": REPETITION_THRESHOLD,
+            "inference_timeout": INFERENCE_TIMEOUT,
+            "graceful_shutdown_timeout": GRACEFUL_SHUTDOWN_TIMEOUT,
+        },
+        "counters": dict(_counters),
     }
 
 
@@ -365,6 +509,17 @@ def health():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     if WORKERS > 1:
-        uvicorn.run("server:app", host=HOST, port=PORT, workers=WORKERS)
+        uvicorn.run(
+            "server:app",
+            host=HOST,
+            port=PORT,
+            workers=WORKERS,
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+        )
     else:
-        uvicorn.run(app, host=HOST, port=PORT)
+        uvicorn.run(
+            app,
+            host=HOST,
+            port=PORT,
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+        )

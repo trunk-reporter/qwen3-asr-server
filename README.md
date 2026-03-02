@@ -89,6 +89,9 @@ cp .env.example .env
 | `PORT` | `8765` | Server port |
 | `WORKERS` | `1` | Uvicorn workers (keep 1 unless multi-GPU) |
 | `SPEECH_RMS_THRESHOLD` | `0.01` | RMS energy gate — audio below this is skipped as silence/encrypted |
+| `REPETITION_THRESHOLD` | `4` | Reject if any n-gram repeats this many times (decoding loop detection) |
+| `INFERENCE_TIMEOUT` | `30` | Per-request inference timeout in seconds |
+| `GRACEFUL_SHUTDOWN_TIMEOUT` | `15` | Seconds to drain in-flight requests on shutdown |
 
 ## API
 
@@ -171,6 +174,34 @@ Threshold tuning (based on P25 radio):
 - Default threshold: 0.01
 
 Adjust `SPEECH_RMS_THRESHOLD` if you're working with different audio sources.
+
+## Hallucination Detection
+
+Known hallucination phrases (e.g., "thank you for watching", "hello how are you doing today...") are matched against the normalized transcription output and rejected with an empty string.
+
+## Repetition Loop Detection
+
+Detects when the model enters a decoding loop (e.g., "Engine 5 Engine 5 Engine 5 Engine 5"). Checks n-grams of size 1-4 and rejects if any pattern repeats `REPETITION_THRESHOLD` (default 4) or more times. Only checks texts with 8+ words to avoid false positives on short, legitimate dispatch audio. The threshold of 4 avoids false positives — dispatch operators legitimately repeat unit names 2-3 times.
+
+## Inference Timeout
+
+Each request has an `INFERENCE_TIMEOUT` (default 30s) safety net. Normal inference completes in <2s; the timeout only catches pathological cases where the model gets stuck in a decoding loop. On timeout, an empty transcription is returned and the event is logged.
+
+## Logging
+
+All events use Python's `logging` module at structured format:
+```
+2026-03-02 14:30:01,234 [12345] INFO OK file=call_123.wav words=15 time=0.832s
+2026-03-02 14:30:02,567 [12345] WARNING REJECT rms_gate file=call_456.wav rms=0.0021 threshold=0.01 time=0.012s
+```
+
+Rejection events (`REJECT rms_gate`, `REJECT hallucination`, `REJECT repetition_loop`, `REJECT timeout`) are logged at WARNING level. Successful transcriptions (`OK`) at INFO level.
+
+The `/health` endpoint includes per-worker counters tracking each outcome.
+
+## Graceful Shutdown
+
+The server uses uvicorn's built-in `timeout_graceful_shutdown` to drain in-flight requests before exiting. Default is 15 seconds. The systemd service sets `TimeoutStopSec=30` to give uvicorn time to finish draining before systemd sends SIGKILL.
 
 ## Running as a Service
 

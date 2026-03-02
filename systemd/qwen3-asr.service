@@ -10,6 +10,7 @@ EnvironmentFile=/home/millerah/qwen3-asr-server/.env
 ExecStart=/home/millerah/qwen3-asr-server/.venv/bin/python server.py
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
