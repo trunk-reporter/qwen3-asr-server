@@ -90,7 +90,7 @@ cp .env.example .env
 | `WORKERS` | `1` | Uvicorn workers (keep 1 unless multi-GPU) |
 | `SPEECH_RMS_THRESHOLD` | `0.01` | RMS energy gate — audio below this is skipped as silence/encrypted |
 | `REPETITION_THRESHOLD` | `4` | Reject if any n-gram repeats this many times (decoding loop detection) |
-| `INFERENCE_TIMEOUT` | `30` | Per-request inference timeout in seconds |
+| `INFERENCE_TIMEOUT` | `120` | Per-request inference timeout in seconds (CPU-safe default) |
 | `GRACEFUL_SHUTDOWN_TIMEOUT` | `15` | Seconds to drain in-flight requests on shutdown |
 | `PYTORCH_MPS_HIGH_WATERMARK_RATIO` | *(unset)* | Cap MPS memory allocations (0.0–1.0). Set to `0.7` on memory-constrained Macs. |
 
@@ -198,7 +198,7 @@ Detects when the model enters a decoding loop (e.g., "Engine 5 Engine 5 Engine 5
 
 ## Inference Timeout
 
-Each request has an `INFERENCE_TIMEOUT` (default 30s) safety net. Normal inference completes in <2s; the timeout only catches pathological cases where the model gets stuck in a decoding loop. On timeout, an empty transcription is returned and the event is logged.
+Each request has an `INFERENCE_TIMEOUT` (default 120s) safety net. GPU inference completes in <2s; CPU inference can take 30-60s for longer audio files. The 120s default is safe for CPU deployments while still catching truly pathological decoding loops. On timeout, an empty transcription is returned and the event is logged.
 
 ## Logging
 

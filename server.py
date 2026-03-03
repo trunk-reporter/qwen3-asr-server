@@ -21,12 +21,13 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 from typing import Optional
 
-import librosa
 import numpy as np
+import soundfile as sf
 import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
@@ -62,8 +63,10 @@ SPEECH_RMS_THRESHOLD = float(os.environ.get("SPEECH_RMS_THRESHOLD", "0.01"))
 # Repetition loop detection — reject decoding loops like "Engine 5 Engine 5 Engine 5 Engine 5"
 REPETITION_THRESHOLD = int(os.environ.get("REPETITION_THRESHOLD", "4"))
 
-# Per-request inference timeout (seconds) — catches pathological decoding
-INFERENCE_TIMEOUT = int(os.environ.get("INFERENCE_TIMEOUT", "30"))
+# Per-request inference timeout (seconds) — catches pathological decoding.
+# GPU inference is <2s; CPU inference can be 30-60s for longer audio.
+# Default of 120s is safe for CPU; GPU users won't notice.
+INFERENCE_TIMEOUT = int(os.environ.get("INFERENCE_TIMEOUT", "120"))
 
 # Graceful shutdown timeout (seconds) — drain in-flight requests before exit
 GRACEFUL_SHUTDOWN_TIMEOUT = int(os.environ.get("GRACEFUL_SHUTDOWN_TIMEOUT", "15"))
@@ -271,16 +274,39 @@ app = FastAPI(title="qwen3-asr-p25-server", version="1.4.0")
 model: Optional[Qwen3ASRModel] = None
 
 
+def _ensure_wav(src_path: str) -> str:
+    """Convert non-wav audio to 16kHz mono wav via ffmpeg.
+
+    Returns the path to the wav file. If the source is already wav,
+    returns the original path unchanged. Otherwise creates a new temp
+    file and returns that path (caller must clean up).
+
+    This avoids librosa's deprecated audioread fallback on m4a/mp3/etc,
+    which is slow and will be removed in librosa 1.0.
+    """
+    if src_path.lower().endswith(".wav"):
+        return src_path
+    wav_path = src_path.rsplit(".", 1)[0] + ".wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src_path, "-ar", "16000", "-ac", "1", wav_path],
+        capture_output=True,
+        check=True,
+    )
+    return wav_path
+
+
 def has_speech(audio_path: str) -> tuple[bool, float]:
     """Check if audio contains actual speech via RMS energy.
 
     Rejects blank/encrypted/silent audio that would cause hallucinations.
     Empirically: blank P25 audio <0.003 RMS, real speech >0.03 RMS.
-    Uses librosa to support all audio formats (wav, m4a, etc.).
+    Expects wav input (use _ensure_wav first for other formats).
 
     Returns (has_speech, rms_value).
     """
-    audio, _ = librosa.load(audio_path, sr=None, mono=True)
+    audio, _ = sf.read(audio_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
     rms = float(np.sqrt(np.mean(audio ** 2)))
     return rms >= SPEECH_RMS_THRESHOLD, rms
 
@@ -354,9 +380,13 @@ async def transcribe(
         tmp.write(data)
         tmp_path = tmp.name
 
+    # Convert non-wav to 16kHz mono wav so soundfile and qwen_asr
+    # can read it directly without the slow audioread fallback.
+    wav_path = _ensure_wav(tmp_path)
+
     try:
         # --- RMS gate ---
-        speech_detected, rms_value = has_speech(tmp_path)
+        speech_detected, rms_value = has_speech(wav_path)
         if not speech_detected:
             processing_time = round(time.time() - t0, 3)
             _counters["reject_rms_gate"] += 1
@@ -370,7 +400,7 @@ async def transcribe(
             # --- Inference with timeout ---
             try:
                 results = await asyncio.wait_for(
-                    asyncio.to_thread(_run_inference, tmp_path, lang, want_timestamps),
+                    asyncio.to_thread(_run_inference, wav_path, lang, want_timestamps),
                     timeout=INFERENCE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -433,6 +463,8 @@ async def transcribe(
 
     finally:
         os.unlink(tmp_path)
+        if wav_path != tmp_path:
+            os.unlink(wav_path)
         flush_mps_cache()  # Release MPS memory after every request
 
     processing_time = round(time.time() - t0, 3)
