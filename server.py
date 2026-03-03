@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -28,11 +29,9 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
-from qwen_asr import Qwen3ASRModel
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,6 +45,8 @@ logger = logging.getLogger("qwen3-asr")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+INFERENCE_BACKEND = os.environ.get("INFERENCE_BACKEND", "python").lower()  # "c" or "python"
+C_BINARY_PATH = os.environ.get("C_BINARY_PATH", "./qwen_asr")
 MODEL_PATH = os.environ.get("MODEL_PATH", "qwen3-asr-p25-0.6B")
 ALIGNER_PATH = os.environ.get("ALIGNER_PATH", "Qwen3-ForcedAligner-0.6B")
 _DEVICE_RAW = os.environ.get("DEVICE", "auto")
@@ -141,12 +142,6 @@ _MPS_WATERMARK = os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO", None)
 if _MPS_WATERMARK is not None:
     os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = _MPS_WATERMARK
 
-DTYPE_MAP = {
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-    "float32": torch.float32,
-}
-
 # Map ISO 639-1 / common short codes to Qwen3-ASR language names
 LANG_MAP = {
     "en": "English", "english": "English",
@@ -180,115 +175,140 @@ _counters = {
 # Device + dtype resolution
 # ---------------------------------------------------------------------------
 
-def resolve_device(requested: str) -> str:
-    """
-    Resolve the best available device.
+# ---------------------------------------------------------------------------
+# Device + dtype resolution (Python backend only)
+# ---------------------------------------------------------------------------
 
-    When DEVICE=auto (the default), priority is:
-      1. CUDA  (NVIDIA GPU — Linux / Windows)
-      2. MPS   (Apple Silicon — macOS 12.3+)
-      3. CPU   (universal fallback)
+if INFERENCE_BACKEND == "python":
+    import torch
+    from qwen_asr import Qwen3ASRModel
 
-    You can still pin a device explicitly:
-      DEVICE=cuda:0   DEVICE=mps   DEVICE=cpu
-    """
-    req = requested.lower().strip()
+    DTYPE_MAP = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
 
-    if req == "auto":
-        if torch.cuda.is_available():
-            return "cuda:0"
-        if torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+    def resolve_device(requested: str) -> str:
+        """
+        Resolve the best available device.
 
-    if req.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("CUDA requested but not available — falling back to CPU")
-        return "cpu"
+        When DEVICE=auto (the default), priority is:
+          1. CUDA  (NVIDIA GPU — Linux / Windows)
+          2. MPS   (Apple Silicon — macOS 12.3+)
+          3. CPU   (universal fallback)
 
-    if req == "mps" and not torch.backends.mps.is_available():
-        logger.warning("MPS requested but not available — falling back to CPU")
-        return "cpu"
+        You can still pin a device explicitly:
+          DEVICE=cuda:0   DEVICE=mps   DEVICE=cpu
+        """
+        req = requested.lower().strip()
 
-    return req
+        if req == "auto":
+            if torch.cuda.is_available():
+                return "cuda:0"
+            if torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
 
+        if req.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available — falling back to CPU")
+            return "cpu"
 
-def resolve_dtype(dtype_str: str, device: str) -> torch.dtype:
-    """
-    Resolve dtype, with an automatic bfloat16 -> float16 fallback on MPS.
+        if req == "mps" and not torch.backends.mps.is_available():
+            logger.warning("MPS requested but not available — falling back to CPU")
+            return "cpu"
 
-    bfloat16 on MPS requires macOS 14+ and PyTorch 2.2+.
-    We probe it at startup and downgrade silently if it isn't supported.
-    """
-    dt = DTYPE_MAP.get(dtype_str.lower(), torch.bfloat16)
-
-    if device == "mps" and dt == torch.bfloat16:
-        try:
-            torch.zeros(1, dtype=torch.bfloat16, device="mps")
-            logger.info("MPS bfloat16 probe: supported")
-        except (RuntimeError, TypeError):
-            logger.info("MPS bfloat16 not supported on this system — using float16 instead")
-            dt = torch.float16
-
-    return dt
+        return req
 
 
-def device_map_arg(device: str):
-    """
-    Convert a device string to the form expected by Qwen3ASRModel / transformers.
+    def resolve_dtype(dtype_str: str, device: str) -> torch.dtype:
+        """
+        Resolve dtype, with an automatic bfloat16 -> float16 fallback on MPS.
 
-    transformers' device_map on MPS must be {"": "mps"} rather than the bare
-    string "mps", because the accelerate dispatcher doesn't enumerate MPS as a
-    named device the way it does for CUDA.  Using {"": "mps"} puts every layer
-    on the single MPS device without going through accelerate's CUDA-specific
-    multi-device path.
+        bfloat16 on MPS requires macOS 14+ and PyTorch 2.2+.
+        We probe it at startup and downgrade silently if it isn't supported.
+        """
+        dt = DTYPE_MAP.get(dtype_str.lower(), torch.bfloat16)
 
-    For CPU we also use the dict form so the code path is consistent.
-    For CUDA strings (e.g. "cuda:0") the bare string works fine.
-    """
-    if device in ("mps", "cpu"):
-        return {"": device}
-    return device  # e.g. "cuda:0" — leave as-is
+        if device == "mps" and dt == torch.bfloat16:
+            try:
+                torch.zeros(1, dtype=torch.bfloat16, device="mps")
+                logger.info("MPS bfloat16 probe: supported")
+            except (RuntimeError, TypeError):
+                logger.info("MPS bfloat16 not supported on this system — using float16 instead")
+                dt = torch.float16
 
-
-def flush_mps_cache():
-    """Release MPS memory after each inference call.
-
-    Unlike CUDA, MPS does not automatically free cached allocations between
-    calls, causing memory to accumulate across requests until the system runs
-    out and crashes with a Metal buffer allocation error.
-    """
-    if DEVICE == "mps":
-        torch.mps.empty_cache()
+        return dt
 
 
-DEVICE = resolve_device(_DEVICE_RAW)
-_DTYPE_OBJ = resolve_dtype(DTYPE, DEVICE)
-_DEVICE_MAP = device_map_arg(DEVICE)
+    def device_map_arg(device: str):
+        """
+        Convert a device string to the form expected by Qwen3ASRModel / transformers.
 
-logger.info(f"Device: {DEVICE}  |  dtype: {_DTYPE_OBJ}  |  device_map: {_DEVICE_MAP}")
+        transformers' device_map on MPS must be {"": "mps"} rather than the bare
+        string "mps", because the accelerate dispatcher doesn't enumerate MPS as a
+        named device the way it does for CUDA.  Using {"": "mps"} puts every layer
+        on the single MPS device without going through accelerate's CUDA-specific
+        multi-device path.
+
+        For CPU we also use the dict form so the code path is consistent.
+        For CUDA strings (e.g. "cuda:0") the bare string works fine.
+        """
+        if device in ("mps", "cpu"):
+            return {"": device}
+        return device  # e.g. "cuda:0" — leave as-is
+
+
+    def flush_mps_cache():
+        """Release MPS memory after each inference call.
+
+        Unlike CUDA, MPS does not automatically free cached allocations between
+        calls, causing memory to accumulate across requests until the system runs
+        out and crashes with a Metal buffer allocation error.
+        """
+        if DEVICE == "mps":
+            torch.mps.empty_cache()
+
+    DEVICE = resolve_device(_DEVICE_RAW)
+    _DTYPE_OBJ = resolve_dtype(DTYPE, DEVICE)
+    _DEVICE_MAP = device_map_arg(DEVICE)
+
+    logger.info(f"Device: {DEVICE}  |  dtype: {_DTYPE_OBJ}  |  device_map: {_DEVICE_MAP}")
+
+else:
+    # C backend — no torch needed
+    DEVICE = "cpu"
+    _DTYPE_OBJ = None
+    _DEVICE_MAP = None
+
+    def flush_mps_cache():
+        pass
+
+    logger.info(f"Backend: C binary ({C_BINARY_PATH})")
 
 # ---------------------------------------------------------------------------
 # App + model
 # ---------------------------------------------------------------------------
-app = FastAPI(title="qwen3-asr-p25-server", version="1.4.0")
-model: Optional[Qwen3ASRModel] = None
+app = FastAPI(title="qwen3-asr-p25-server", version="1.5.0")
+model = None  # Only loaded for python backend
 
 
 def _ensure_wav(src_path: str) -> str:
-    """Convert non-wav audio to 16kHz mono wav via ffmpeg.
+    """Convert audio to 16kHz mono wav via ffmpeg if needed.
 
     Returns the path to the wav file. If the source is already wav,
     returns the original path unchanged. Otherwise creates a new temp
     file and returns that path (caller must clean up).
 
-    This avoids librosa's deprecated audioread fallback on m4a/mp3/etc,
-    which is slow and will be removed in librosa 1.0.
+    Always produces 16kHz mono — required by the C binary, and consistent
+    for the Python backend too.
     """
     if src_path.lower().endswith(".wav"):
         return src_path
     wav_path = src_path.rsplit(".", 1)[0] + ".wav"
     subprocess.run(
-        ["ffmpeg", "-y", "-i", src_path, "-ar", "16000", "-ac", "1", wav_path],
+        ["ffmpeg", "-y", "-i", src_path, "-ar", "16000", "-ac", "1",
+         "-loglevel", "error", wav_path],
         capture_output=True,
         check=True,
     )
@@ -321,24 +341,67 @@ def _run_inference(audio_path: str, lang: str, want_timestamps: bool):
     return results
 
 
+# ---------------------------------------------------------------------------
+# C backend inference
+# ---------------------------------------------------------------------------
+async def _run_c_inference(wav_path: str, language: str = "English") -> str:
+    """Transcribe via antirez/qwen-asr C binary.
+
+    Takes a 16kHz mono WAV (already produced by _ensure_wav).
+    Non-blocking: uses asyncio subprocess so uvicorn stays responsive.
+    """
+    asr_cmd = [
+        C_BINARY_PATH,
+        "-d", MODEL_PATH,
+        "-i", wav_path,
+        "--silent",
+        "--language", language,
+    ]
+    asr_proc = await asyncio.create_subprocess_exec(
+        *asr_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asr_proc.communicate()
+    if asr_proc.returncode != 0:
+        raise RuntimeError(f"qwen_asr failed (rc={asr_proc.returncode}): {stderr.decode()}")
+    return stdout.decode().strip()
+
+
 @app.on_event("startup")
 def load_model():
     global model
-    logger.info(f"Loading model: {MODEL_PATH} (device={DEVICE}, dtype={DTYPE})")
-    logger.info(f"Loading aligner: {ALIGNER_PATH}")
-    model = Qwen3ASRModel.from_pretrained(
-        MODEL_PATH,
-        forced_aligner=ALIGNER_PATH,
-        forced_aligner_kwargs=dict(dtype=_DTYPE_OBJ, device_map=_DEVICE_MAP),
-        dtype=_DTYPE_OBJ,
-        device_map=_DEVICE_MAP,
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
-    logger.info("Model + aligner loaded.")
-    logger.info(f"Speech detection: RMS threshold={SPEECH_RMS_THRESHOLD}")
-    logger.info(f"Repetition detection: threshold={REPETITION_THRESHOLD}")
-    logger.info(f"Inference timeout: {INFERENCE_TIMEOUT}s")
-    logger.info(f"Graceful shutdown timeout: {GRACEFUL_SHUTDOWN_TIMEOUT}s")
+    if INFERENCE_BACKEND == "c":
+        if not shutil.which(C_BINARY_PATH) and not os.path.isfile(C_BINARY_PATH):
+            raise RuntimeError(
+                f"C binary not found at {C_BINARY_PATH}. "
+                f"Build it with: cd qwen-asr && make blas"
+            )
+        if not os.path.isdir(MODEL_PATH):
+            raise RuntimeError(f"Model directory not found: {MODEL_PATH}")
+        logger.info(f"Backend: C binary ({C_BINARY_PATH})")
+        logger.info(f"Model dir: {MODEL_PATH}")
+        logger.info(f"Speech detection: RMS threshold={SPEECH_RMS_THRESHOLD}")
+        logger.info(f"Repetition detection: threshold={REPETITION_THRESHOLD}")
+        logger.info(f"Inference timeout: {INFERENCE_TIMEOUT}s")
+        logger.info(f"Graceful shutdown timeout: {GRACEFUL_SHUTDOWN_TIMEOUT}s")
+        logger.info("Ready. First request will be slow (model mmap cold cache).")
+    else:
+        logger.info(f"Loading model: {MODEL_PATH} (device={DEVICE}, dtype={DTYPE})")
+        logger.info(f"Loading aligner: {ALIGNER_PATH}")
+        model = Qwen3ASRModel.from_pretrained(
+            MODEL_PATH,
+            forced_aligner=ALIGNER_PATH,
+            forced_aligner_kwargs=dict(dtype=_DTYPE_OBJ, device_map=_DEVICE_MAP),
+            dtype=_DTYPE_OBJ,
+            device_map=_DEVICE_MAP,
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
+        logger.info("Model + aligner loaded.")
+        logger.info(f"Speech detection: RMS threshold={SPEECH_RMS_THRESHOLD}")
+        logger.info(f"Repetition detection: threshold={REPETITION_THRESHOLD}")
+        logger.info(f"Inference timeout: {INFERENCE_TIMEOUT}s")
+        logger.info(f"Graceful shutdown timeout: {GRACEFUL_SHUTDOWN_TIMEOUT}s")
 
 
 @app.on_event("shutdown")
@@ -399,10 +462,19 @@ async def transcribe(
         else:
             # --- Inference with timeout ---
             try:
-                results = await asyncio.wait_for(
-                    asyncio.to_thread(_run_inference, wav_path, lang, want_timestamps),
-                    timeout=INFERENCE_TIMEOUT,
-                )
+                if INFERENCE_BACKEND == "c":
+                    full_text = await asyncio.wait_for(
+                        _run_c_inference(wav_path, language=lang),
+                        timeout=INFERENCE_TIMEOUT,
+                    )
+                    words = []
+                else:
+                    results = await asyncio.wait_for(
+                        asyncio.to_thread(_run_inference, wav_path, lang, want_timestamps),
+                        timeout=INFERENCE_TIMEOUT,
+                    )
+                    r = results[0] if results else None
+                    full_text = r.text.strip() if r else ""
             except asyncio.TimeoutError:
                 processing_time = round(time.time() - t0, 3)
                 _counters["reject_timeout"] += 1
@@ -416,8 +488,6 @@ async def transcribe(
                 return _format_response(response_format, full_text, words, lang,
                                         want_timestamps, round(time.time() - t0, 3))
 
-            r = results[0] if results else None
-            full_text = r.text.strip() if r else ""
             processing_time = round(time.time() - t0, 3)
 
             # --- Hallucination filter ---
@@ -516,11 +586,11 @@ def list_models():
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {
+    info = {
         "status": "ok",
-        "version": "1.4.0",
+        "version": "1.5.0",
+        "inference_backend": INFERENCE_BACKEND,
         "model": MODEL_PATH,
-        "aligner": ALIGNER_PATH,
         "device": DEVICE,
         "dtype": DTYPE,
         "workers": WORKERS,
@@ -534,6 +604,11 @@ def health():
         },
         "counters": dict(_counters),
     }
+    if INFERENCE_BACKEND == "c":
+        info["c_binary"] = C_BINARY_PATH
+    else:
+        info["aligner"] = ALIGNER_PATH
+    return info
 
 
 # ---------------------------------------------------------------------------

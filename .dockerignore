@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.git/
+qwen3-asr-p25-0.6B/
+Qwen3-ForcedAligner-0.6B/
+systemd/
+*.log
+CLAUDE.md
+README.md
