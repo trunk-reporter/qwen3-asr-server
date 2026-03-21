@@ -6,6 +6,9 @@ Drop-in replacement for whisper-server — any client that talks to the OpenAI `
 
 ## Requirements
 
+**Docker:** Just Docker (and `nvidia-container-toolkit` for GPU). No other dependencies needed.
+
+**Native install:**
 - Python 3.10+
 - GPU: NVIDIA CUDA or Apple Silicon MPS (~4GB VRAM for both models at bfloat16). Falls back to CPU if neither is available.
 - `ffmpeg` (for non-wav audio format conversion)
@@ -49,6 +52,30 @@ docker compose -f docker-compose.cpu.yml up -d
 | macOS Intel | yes | — | yes (CPU) |
 
 The GPU image requires NVIDIA + `nvidia-container-toolkit` on the host. macOS users who want GPU acceleration should run natively — MPS isn't available inside Docker containers.
+
+### Docker configuration
+
+Pass environment variables with `-e` to customize behavior:
+
+```bash
+docker run --gpus all -p 8765:8765 \
+  -e SPEECH_RMS_THRESHOLD=0.02 \
+  -e INFERENCE_TIMEOUT=60 \
+  -v asr-model:/model -v asr-aligner:/aligner \
+  ghcr.io/trunk-reporter/qwen3-asr-server:gpu
+```
+
+See the [Configuration](#configuration) section for all available variables.
+
+### Building images locally
+
+```bash
+# CPU
+docker build -t qwen3-asr-server:cpu .
+
+# GPU
+docker build -f Dockerfile.gpu -t qwen3-asr-server:gpu .
+```
 
 ### Pre-downloaded models
 
@@ -180,8 +207,8 @@ curl -X POST http://localhost:8765/v1/audio/transcriptions \
 | `model` | string | `qwen3-asr-p25` | Model name (ignored, for API compat) |
 | `language` | string | `English` | Language code (`en`, `zh`, `fr`, etc.) or full name |
 | `response_format` | string | `json` | `json`, `verbose_json`, or `text` |
-| `word_timestamps` | bool | `false` | Enable word-level timestamps |
-| `timestamp_granularities[]` | list | — | Set to `word` to enable timestamps |
+| `word_timestamps` | bool | `false` | Enable word-level timestamps (Python backend only) |
+| `timestamp_granularities[]` | list | — | Set to `word` to enable timestamps (Python backend only) |
 
 **Response formats:**
 
@@ -218,7 +245,25 @@ Lists the loaded model. Compatible with OpenAI model listing.
 
 Returns server status, model info, current configuration, and per-worker request counters.
 
+## Inference Backends
+
+The server supports two inference backends:
+
+**Python** (`INFERENCE_BACKEND=python`, default) — Uses PyTorch + transformers with GPU acceleration (CUDA or MPS). Supports word-level timestamps via the ForcedAligner. This is the full-featured backend for production use with a GPU.
+
+**C** (`INFERENCE_BACKEND=c`) — Uses the [antirez/qwen-asr](https://github.com/antirez/qwen-asr) C binary. No GPU, no PyTorch, no CUDA required. The model weights are memory-mapped and inference runs on CPU via OpenBLAS. The Docker CPU image is ~800MB vs multi-GB for the GPU image. Trade-off: no word-level timestamps.
+
+| | Python backend | C backend |
+|---|---|---|
+| GPU acceleration | CUDA, MPS | — |
+| Word-level timestamps | yes | no |
+| Docker image size | ~8GB | ~800MB |
+| Dependencies | torch, transformers, qwen_asr | just the C binary |
+| Typical inference time | <2s (GPU) | ~2-5s (CPU) |
+
 ## Device Auto-Detection
+
+*Applies to the Python backend only. The C backend always runs on CPU.*
 
 The server automatically selects the best available device at startup:
 
