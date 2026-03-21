@@ -11,33 +11,44 @@
 #     -v ./Qwen3-ForcedAligner-0.6B:/aligner \
 #     qwen3-asr-server:gpu
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# --- Stage 1: Install Python deps ---
+FROM python:3.11-slim-bookworm AS builder
 
-# Avoid interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
+RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cu124
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Install Python deps — torch with CUDA, transformers, qwen_asr
-# Install build deps first, then packages that need them at install time
-RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip3 install --no-cache-dir numpy typing_extensions && \
-    pip3 install --no-cache-dir \
-    torch \
+RUN pip install --no-cache-dir \
     'transformers>=4.50' \
-    accelerate \
     fastapi \
     'uvicorn[standard]' \
     python-multipart \
     soundfile \
+    numpy \
     qwen_asr \
     huggingface_hub
+
+# Strip torch bloat — test suites, C++ headers, static libs,
+# and build metadata not needed for inference.
+RUN rm -rf \
+    /usr/local/lib/python3.11/site-packages/torch/test \
+    /usr/local/lib/python3.11/site-packages/torch/include \
+    /usr/local/lib/python3.11/site-packages/torch/share \
+    /usr/local/lib/python3.11/site-packages/torch/lib/*.a \
+    && find /usr/local/lib/python3.11/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.11/site-packages -name '*.pyc' -delete 2>/dev/null || true
+
+# --- Stage 2: Runtime ---
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+WORKDIR /app
 
 # Copy server + entrypoint
 COPY server.py entrypoint.sh ./
