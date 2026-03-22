@@ -8,4 +8,10 @@ services:
     environment:
       - INFERENCE_BACKEND=c
       - SPEECH_RMS_THRESHOLD=0.01
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/health | jq -e '.status == \"ok\"' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
     restart: unless-stopped
