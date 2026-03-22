@@ -94,6 +94,36 @@ docker run -p 8765:8765 \
   ghcr.io/trunk-reporter/qwen3-asr-server:cpu
 ```
 
+## Updating
+
+### Docker
+
+Pull the latest image and restart:
+
+```bash
+# GPU
+docker pull ghcr.io/trunk-reporter/qwen3-asr-server:gpu
+docker compose -f docker-compose.gpu.yml up -d
+
+# CPU
+docker pull ghcr.io/trunk-reporter/qwen3-asr-server:cpu
+docker compose -f docker-compose.cpu.yml up -d
+```
+
+Or if running with `docker run`, just stop the container and re-run with the same command — the new image will be used.
+
+Your model weights persist in the Docker volume, so they won't be re-downloaded.
+
+### Native install
+
+```bash
+cd qwen3-asr-server
+git pull
+./start.sh
+```
+
+`start.sh` will automatically install any new dependencies before starting the server.
+
 ## Quick Start without Docker
 
 ### 1. Clone and download model weights
