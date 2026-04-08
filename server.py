@@ -112,26 +112,35 @@ def is_hallucination(text: str) -> tuple[bool, str]:
 def has_repetition_loop(text: str) -> tuple[bool, str]:
     """Detect repetition loops in transcription output.
 
-    Checks n-grams of size 1-4. If any n-gram repeats REPETITION_THRESHOLD
-    or more times, the text is flagged as a decoding loop.
+    Uses a two-tier check:
+      1. Any n-gram (1-4) repeating >= REPETITION_THRESHOLD times (absolute)
+      2. AND that n-gram must cover >= 30% of the total words (ratio check)
 
-    Only checks texts with 8+ words — short texts can't have 4 meaningful reps.
+    The ratio check prevents false positives on common English words like
+    "the", "a", "and" which naturally repeat in longer utterances without
+    being hallucination loops.
+
+    Only checks texts with 8+ words — short texts can't have meaningful reps.
 
     Returns (is_loop, repeated_pattern).
     """
     words = text.split()
-    if len(words) < 8:
+    n_words = len(words)
+    if n_words < 8:
         return False, ""
 
     for n in range(1, 5):  # 1-gram through 4-gram
-        if len(words) < n:
+        if n_words < n:
             continue
         counts: dict[str, int] = {}
-        for i in range(len(words) - n + 1):
+        for i in range(n_words - n + 1):
             gram = " ".join(words[i:i + n])
             counts[gram] = counts.get(gram, 0) + 1
             if counts[gram] >= REPETITION_THRESHOLD:
-                return True, gram
+                # Ratio check: n-gram instances * n words each / total words
+                coverage = (counts[gram] * n) / n_words
+                if coverage >= 0.30:
+                    return True, gram
     return False, ""
 
 # MPS memory management — cap MPS allocations to this fraction of system RAM.
