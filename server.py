@@ -296,7 +296,7 @@ else:
 # ---------------------------------------------------------------------------
 # App + model
 # ---------------------------------------------------------------------------
-app = FastAPI(title="qwen3-asr-p25-server", version="1.6.1")
+app = FastAPI(title="qwen3-asr-p25-server", version="1.7.0")
 model = None  # Only loaded for python backend
 
 
@@ -604,7 +604,7 @@ def list_models():
 def health():
     info = {
         "status": "ok",
-        "version": "1.6.1",
+        "version": "1.7.0",
         "inference_backend": INFERENCE_BACKEND,
         "model": MODEL_PATH,
         "device": DEVICE,
