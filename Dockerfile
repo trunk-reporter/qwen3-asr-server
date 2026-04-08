@@ -26,9 +26,12 @@ FROM python:3.11-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ffmpeg \
-    jq \
     libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1001 appuser \
+    && mkdir -p /model \
+    && chown appuser:appuser /model
 
 WORKDIR /app
 
@@ -39,7 +42,7 @@ RUN pip install --no-cache-dir \
     python-multipart \
     soundfile \
     numpy \
-    huggingface_hub
+    'huggingface_hub>=0.34'
 
 # Copy C binary from builder
 COPY --from=builder /build/qwen_asr /app/qwen_asr
@@ -57,5 +60,7 @@ ENV INFERENCE_BACKEND=c \
     SPEECH_RMS_THRESHOLD=0.01
 
 EXPOSE 8765
+
+USER appuser
 
 ENTRYPOINT ["/app/entrypoint.sh"]

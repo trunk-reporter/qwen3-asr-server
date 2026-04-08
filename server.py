@@ -114,11 +114,12 @@ def has_repetition_loop(text: str) -> tuple[bool, str]:
 
     Uses a two-tier check:
       1. Any n-gram (1-4) repeating >= REPETITION_THRESHOLD times (absolute)
-      2. AND that n-gram must cover >= 30% of the total words (ratio check)
+      2. AND that n-gram must cover >= a scaled fraction of total words (ratio check)
 
-    The ratio check prevents false positives on common English words like
-    "the", "a", "and" which naturally repeat in longer utterances without
-    being hallucination loops.
+    The coverage threshold scales inversely with n-gram size:
+      1-gram: 30%, 2-gram: 15%, 3-gram: 10%, 4-gram: 7.5%
+    This prevents false positives on common words ("the", "a") while still
+    catching multi-word repetition loops in longer transcriptions.
 
     Only checks texts with 8+ words — short texts can't have meaningful reps.
 
@@ -132,6 +133,7 @@ def has_repetition_loop(text: str) -> tuple[bool, str]:
     for n in range(1, 5):  # 1-gram through 4-gram
         if n_words < n:
             continue
+        coverage_threshold = 0.30 / n
         counts: dict[str, int] = {}
         for i in range(n_words - n + 1):
             gram = " ".join(words[i:i + n])
@@ -139,7 +141,7 @@ def has_repetition_loop(text: str) -> tuple[bool, str]:
             if counts[gram] >= REPETITION_THRESHOLD:
                 # Ratio check: n-gram instances * n words each / total words
                 coverage = (counts[gram] * n) / n_words
-                if coverage >= 0.30:
+                if coverage >= coverage_threshold:
                     return True, gram
     return False, ""
 

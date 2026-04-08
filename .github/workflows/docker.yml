@@ -94,8 +94,17 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || 'N/A' }}
+          BRANCH: ${{ github.ref_name }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+          SAFE_COMMIT=$(echo "$COMMIT_MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          MESSAGE="🔴 <b>CI Failed:</b> qwen3-asr-server/${WORKFLOW}
+<b>Branch:</b> ${BRANCH}
+<b>Commit:</b> ${SAFE_COMMIT}
+<a href=\"${RUN_URL}\">View Run</a>"
+          curl -fsSX POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            --data-urlencode "text=$MESSAGE" \
             -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d parse_mode="HTML" \
-            -d text="🔴 <b>CI Failed:</b> qwen3-asr-server/${{ github.workflow }}%0A<b>Branch:</b> ${{ github.ref_name }}%0A<b>Commit:</b> ${{ github.event.head_commit.message || 'N/A' }}%0A<a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View Run</a>"
+            -d parse_mode="HTML"
