@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # ---------------------------------------------------------------------------
@@ -55,6 +55,18 @@ MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "512"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
 WORKERS = int(os.environ.get("WORKERS", "1"))
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+SUPPORTED_MEDIA_TYPES = {
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/flac",
+    "audio/ogg",
+    "application/octet-stream",
+}
 
 # Speech detection — reject blank/encrypted audio before wasting GPU
 # RMS energy threshold: audio below this is silence/static/encrypted
@@ -428,6 +440,7 @@ def on_shutdown():
 # ---------------------------------------------------------------------------
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
+    request: Request,
     file: UploadFile = File(...),
     model_name: str = Form("qwen3-asr-p25", alias="model"),
     language: Optional[str] = Form("English"),
@@ -440,6 +453,18 @@ async def transcribe(
     filename = file.filename or "unknown"
     _counters["total"] += 1
 
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid content-length")
+        if declared_size > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="upload too large")
+
+    if file.content_type and file.content_type not in SUPPORTED_MEDIA_TYPES:
+        raise HTTPException(status_code=415, detail=f"unsupported media type: {file.content_type}")
+
     # Determine if timestamps requested
     want_timestamps = word_timestamps or bool(
         timestamp_granularities and "word" in timestamp_granularities
@@ -449,18 +474,25 @@ async def transcribe(
     lang = (language or "English").strip()
     lang = LANG_MAP.get(lang.lower(), lang)
 
-    # Write upload to temp file
-    data = await file.read()
     suffix = os.path.splitext(filename)[1] or ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
-    # Convert non-wav to 16kHz mono wav so soundfile and qwen_asr
-    # can read it directly without the slow audioread fallback.
-    wav_path = _ensure_wav(tmp_path)
+    tmp_path = ""
+    wav_path = ""
 
     try:
+        # Stream upload to disk with a hard cap instead of reading the full body.
+        total = 0
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="upload too large")
+                tmp.write(chunk)
+
+        # Convert non-wav to 16kHz mono wav so soundfile and qwen_asr
+        # can read it directly without the slow audioread fallback.
+        wav_path = _ensure_wav(tmp_path)
+
         # --- RMS gate ---
         speech_detected, rms_value = has_speech(wav_path)
         if not speech_detected:
@@ -548,8 +580,9 @@ async def transcribe(
                             })
 
     finally:
-        os.unlink(tmp_path)
-        if wav_path != tmp_path:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        if wav_path and wav_path != tmp_path and os.path.exists(wav_path):
             os.unlink(wav_path)
         flush_mps_cache()  # Release MPS memory after every request
 
