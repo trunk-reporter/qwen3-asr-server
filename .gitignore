@@ -6,6 +6,8 @@ __pycache__/
 # Model weights (too large for git — download separately)
 qwen3-asr-p25-0.6B/
 Qwen3-ForcedAligner-0.6B/
+Qwen3-ASR-1.7B/
+Qwen3-ASR-1.7B-flat/
 
 # Runtime
 server.log
